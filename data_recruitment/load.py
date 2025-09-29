@@ -2,8 +2,8 @@ import pandas as pd
 import os
 
 def load(df, demographi_report, filename):
-    os.makedirs("cleaned_data", exist_ok=True)
-    path = f"cleaned_data/{filename}.xlsx"
+    os.makedirs("output", exist_ok=True)
+    path = f"output/{filename}.xlsx"
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         # Sheet utama: data hasil transformasi

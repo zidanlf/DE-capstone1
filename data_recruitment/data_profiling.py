@@ -2,7 +2,7 @@ import pandas as pd
 import os
 
 def inspect_data(df, filename="inspect_data_recruitment.txt"):
-    filepath = os.path.join("cleaned_data", filename)
+    filepath = os.path.join("output", filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("=== INFO ===\n")

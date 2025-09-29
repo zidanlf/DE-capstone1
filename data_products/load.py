@@ -1,19 +1,9 @@
-# import pandas as pd
-# import os
-
-# def load_product(df, filename="All Exercise and Fitness.csv"):
-#     output_path = f"cleaned_data/{filename}"
-#     df.to_csv(output_path, index=False)
-#     print(f"Data saved to: {output_path}")
-    
-#     return output_path
-
 import pandas as pd
 import os
 
 def load_product(df, demographi_report, filename):
-    os.makedirs("cleaned_data", exist_ok=True)
-    path = f"cleaned_data/{filename}.xlsx"
+    os.makedirs("output", exist_ok=True)
+    path = f"output/{filename}.xlsx"
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         # Sheet utama
