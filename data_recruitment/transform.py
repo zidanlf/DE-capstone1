@@ -5,6 +5,12 @@ import numpy as np
 pd.set_option('future.no_silent_downcasting', True)
 
 def transform(df):
+    """
+    Transform recruitment data.
+    Philosophy: Keep NaN for truly missing data to preserve data integrity.
+    Only fill with meaningful defaults where it makes business sense.
+    """
+    
     # 0. Hapus kolom "Unnamed: 0" kalau ada
     if "Unnamed: 0" in df.columns:
         df = df.drop(columns=["Unnamed: 0"])
@@ -13,8 +19,9 @@ def transform(df):
     df["company"] = df["company"].str.replace(r"\s*\d+(\.\d+)?$", "", regex=True).str.strip()
     df = df[df["company"].notna() & (df["company"].str.strip() != "")]
 
-    # 2. company_rating → NaN jadi 0, ubah ke float
-    df["company_rating"] = pd.to_numeric(df["company_rating"], errors="coerce").fillna(0.0)
+    # 2. company_rating → Keep NaN for missing ratings
+    # Note: NaN means "not rated yet" which is different from rating of 0
+    df["company_rating"] = pd.to_numeric(df["company_rating"], errors="coerce")
 
     # 3. Parsing job_description
     def parse_description(desc):
@@ -44,7 +51,7 @@ def transform(df):
             "Senior": r"\b(senior|lead|6\+?\s+years?|8\+?\s+years?|manager|principal|staff|architect)\b"
         }
         
-        level = "Not Specified"  # Default value instead of None
+        level = None  # Keep as None instead of "Not Specified"
         for lvl, pattern in level_patterns.items():
             if re.search(pattern, desc, re.IGNORECASE):
                 level = lvl
@@ -65,7 +72,7 @@ def transform(df):
         if re.search(r"\bhybrid\b", desc, re.IGNORECASE):
             job_types.append("Hybrid")
             
-        job_type = ", ".join(job_types) if job_types else "Not Specified"
+        job_type = ", ".join(job_types) if job_types else None
 
         # --- Benefits
         benefits_keywords = {
@@ -87,10 +94,10 @@ def transform(df):
                     break  
 
         return pd.Series([
-            ", ".join(skills) if skills else "Not Specified",
+            ", ".join(skills) if skills else None,
             level,
             job_type,
-            ", ".join(benefits) if benefits else "Not Specified"
+            ", ".join(benefits) if benefits else None
         ])
 
     df[["skills", "experience_level", "job_type", "benefits"]] = df["job_description"].apply(parse_description)
@@ -98,48 +105,51 @@ def transform(df):
     # 4. Parsing salary_estimate → float + unit + currency
     def parse_salary(s):
         if pd.isna(s):
-            return pd.Series([0.0, "-", "-"])
+            return pd.Series([np.nan, None, None])
         match = re.search(r"([\d,\.]+)", s)
-        salary = float(match.group(1).replace(",", "")) if match else 0.0
-        unit = "per year" if "yr" in s else "per hour" if "hr" in s else "-"
-        currency = "$" if "$" in s else "-"
+        salary = float(match.group(1).replace(",", "")) if match else np.nan
+        unit = "per year" if "yr" in s else "per hour" if "hr" in s else None
+        currency = "$" if "$" in s else None
         return pd.Series([salary, unit, currency])
 
     df[["salary_estimate", "salary_unit", "currency"]] = df["salary_estimate"].apply(parse_salary)
 
-    # 4b. Imputasi salary_estimate yang bernilai 0
-
+    # 4b. Imputasi salary_estimate yang bernilai NaN
+    # Note: Only impute if we have similar jobs with known salaries
     def fill_salary(row):
-        if row["salary_estimate"] > 0:
+        if pd.notna(row["salary_estimate"]) and row["salary_estimate"] > 0:
             return row["salary_estimate"]
 
         mask = (
             (df["company"] == row["company"]) &
             (df["job_title"] == row["job_title"]) &
             (df["experience_level"] == row["experience_level"]) &
+            (df["salary_estimate"].notna()) &
             (df["salary_estimate"] > 0)
         )
         if mask.any():
             return df.loc[mask, "salary_estimate"].median()
+        
+        # If no match found, keep as NaN (don't force to 0)
+        return np.nan
 
     df["salary_estimate"] = df.apply(fill_salary, axis=1)
 
-    # 5-8. Improved missing values handling
+    # 5-8. Keep NaN for missing categorical data
+    # Note: NaN is more honest than "-" for missing data
+    # Let downstream systems decide how to handle missing values
     for col in ["company_size", "company_type", "company_sector", "company_industry"]:
-        # First try to fill within same company
+        # Try to fill within same company first
         df[col] = df.groupby("company")[col].transform(lambda x: x.ffill().bfill())
-        
-        # Then fill remaining NaN with "-"
-        df[col] = df[col].fillna("-")
-        
-        # Handle empty strings
-        df[col] = df[col].replace("", "-")
+        # Keep remaining as NaN (don't fill with "-")
 
-    # 9. Company founded → isi 0 kalau kosong, ubah ke int
-    df["company_founded"] = pd.to_numeric(df["company_founded"], errors="coerce").fillna(0).astype(int)
+    # 9. Company founded → Keep as nullable integer (Int64)
+    # Note: NaN means "founding year unknown", which is different from year 0 or -1
+    df["company_founded"] = pd.to_numeric(df["company_founded"], errors="coerce").astype("Int64")
 
-    # 10. Company revenue → isi "-" kalau kosong
-    df["company_revenue"] = df["company_revenue"].fillna("-").replace("", "-")
+    # 10. Company revenue → Keep NaN for missing
+    # Note: NaN is clearer than "-" for data pipelines
+    df["company_revenue"] = df["company_revenue"].replace("", np.nan)
 
     # 11. Improved date formatting
     df["dates"] = pd.to_datetime(df["dates"], errors="coerce", utc=True)
@@ -152,6 +162,10 @@ def transform(df):
     return df
 
 def demographi(df):
+    """
+    Generate demographic report.
+    Handles NaN values appropriately in statistics.
+    """
     report = {}
 
     # === TEKNIS ===
@@ -175,7 +189,9 @@ def demographi(df):
     report["Data_Types"] = dtype_counts
 
     # Descriptive stats untuk numeric (kecuali salary_estimate)
-    num_cols = [c for c in df.select_dtypes(include=["int64","float64"]).columns if c != "salary_estimate"]
+    # Use dropna() in calculations to exclude NaN properly
+    num_cols = [c for c in df.select_dtypes(include=["int64","float64","Int64"]).columns 
+                if c != "salary_estimate"]
     if num_cols:
         num_desc = df[num_cols].describe().T.reset_index()
         num_desc.rename(columns={"index": "Column"}, inplace=True)
@@ -183,14 +199,14 @@ def demographi(df):
 
     # Descriptive stats salary dipisah berdasarkan unit
     salary_stats = {}
-    for unit in df["salary_unit"].unique():
-        if unit != "-":
-            sub = df[df["salary_unit"] == unit]["salary_estimate"]
-            if not sub.empty:
-                desc = sub.describe().reset_index()
-                desc.columns = ["Stat", "Value"]
-                salary_stats[unit] = desc
-    report["Salary_Stats_By_Unit"] = salary_stats
+    for unit in df["salary_unit"].dropna().unique():
+        sub = df[df["salary_unit"] == unit]["salary_estimate"].dropna()
+        if not sub.empty:
+            desc = sub.describe().reset_index()
+            desc.columns = ["Stat", "Value"]
+            salary_stats[unit] = desc
+    if salary_stats:
+        report["Salary_Stats_By_Unit"] = salary_stats
 
     # Missing values detail
     miss = df.isnull().sum().reset_index()
@@ -198,56 +214,67 @@ def demographi(df):
     report["Missing_By_Column"] = miss
 
     # === BISNIS / DEMOGRAFI ===
-    biz = {
-        "Avg Company Rating": df["company_rating"].mean(),
-        "Median Company Rating": df["company_rating"].median(),
-        "Earliest Founded": df["company_founded"].min(),
-        "Latest Founded": df["company_founded"].max(),
-    }
+    biz = {}
+    
+    # Company rating stats (skip NaN)
+    if df["company_rating"].notna().any():
+        biz["Avg Company Rating"] = df["company_rating"].mean()
+        biz["Median Company Rating"] = df["company_rating"].median()
+    
+    # Company founded stats (skip NaN)
+    founded_valid = df["company_founded"].dropna()
+    if not founded_valid.empty:
+        biz["Earliest Founded"] = int(founded_valid.min())
+        biz["Latest Founded"] = int(founded_valid.max())
 
     # Salary summary per unit
     salary_summary = []
-    for unit in df["salary_unit"].unique():
-        if unit != "-":
-            sub = df[df["salary_unit"] == unit]
-            salary_summary.append([f"Median Salary ({unit})", sub["salary_estimate"].median()])
-            salary_summary.append([f"Average Salary ({unit})", sub["salary_estimate"].mean()])
+    for unit in df["salary_unit"].dropna().unique():
+        sub = df[df["salary_unit"] == unit]["salary_estimate"].dropna()
+        if not sub.empty:
+            salary_summary.append([f"Median Salary ({unit})", sub.median()])
+            salary_summary.append([f"Average Salary ({unit})", sub.mean()])
 
     biz_df = pd.DataFrame(list(biz.items()), columns=["Metric","Value"])
-    salary_df = pd.DataFrame(salary_summary, columns=["Metric","Value"])
-    report["Business_Summary"] = pd.concat([biz_df, salary_df], ignore_index=True)
+    if salary_summary:
+        salary_df = pd.DataFrame(salary_summary, columns=["Metric","Value"])
+        report["Business_Summary"] = pd.concat([biz_df, salary_df], ignore_index=True)
+    else:
+        report["Business_Summary"] = biz_df
 
-    # Top Skills
+    # Top Skills (skip NaN)
     skills_series = df["skills"].dropna().str.split(", ")
-    all_skills = skills_series.explode().value_counts().reset_index()
-    all_skills.columns = ["Skill","Count"]
-    report["Top_Skills"] = all_skills.head(10)
+    if not skills_series.empty:
+        all_skills = skills_series.explode().value_counts().reset_index()
+        all_skills.columns = ["Skill","Count"]
+        report["Top_Skills"] = all_skills.head(10)
 
-    # Distribusi Experience Level
-    exp_dist = df["experience_level"].value_counts().reset_index()
+    # Distribusi Experience Level (skip NaN)
+    exp_dist = df["experience_level"].value_counts(dropna=False).reset_index()
     exp_dist.columns = ["Experience_Level","Count"]
     report["Experience_Distribution"] = exp_dist
 
-    # Distribusi Job Type
+    # Distribusi Job Type (skip NaN)
     jobtype_series = df["job_type"].dropna().str.split(", ")
-    job_dist = jobtype_series.explode().value_counts().reset_index()
-    job_dist.columns = ["Job_Type","Count"]
-    report["JobType_Distribution"] = job_dist
+    if not jobtype_series.empty:
+        job_dist = jobtype_series.explode().value_counts().reset_index()
+        job_dist.columns = ["Job_Type","Count"]
+        report["JobType_Distribution"] = job_dist
 
     # Top Companies dengan lowongan terbanyak
     top_companies = df["company"].value_counts().head(10).reset_index()
     top_companies.columns = ["Company","Job_Postings"]
     report["Top_Companies"] = top_companies
 
-    # Distribusi Salary (binning per unit)
+    # Distribusi Salary (binning per unit, skip NaN)
     salary_dist_list = {}
-    for unit in df["salary_unit"].unique():
-        if unit != "-":
-            sub = df[df["salary_unit"] == unit]
-            if sub["salary_estimate"].notna().any():
-                salary_dist = pd.cut(sub["salary_estimate"], bins=5).value_counts().reset_index()
-                salary_dist.columns = ["Salary_Range","Count"]
-                salary_dist_list[unit] = salary_dist
-    report["Salary_Distribution"] = salary_dist_list
+    for unit in df["salary_unit"].dropna().unique():
+        sub = df[df["salary_unit"] == unit]["salary_estimate"].dropna()
+        if len(sub) > 0:
+            salary_dist = pd.cut(sub, bins=5).value_counts().reset_index()
+            salary_dist.columns = ["Salary_Range","Count"]
+            salary_dist_list[unit] = salary_dist
+    if salary_dist_list:
+        report["Salary_Distribution"] = salary_dist_list
 
     return report
